@@ -3,7 +3,11 @@ import os
 import asyncio
 import io
 import traceback
+import tempfile
+import shutil
+from typing import List, Tuple
 from fastapi import FastAPI, Request, Response
+from starlette.datastructures import UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +54,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+async def _save_uploaded_audio_files(upload_files: List[UploadFile]) -> Tuple[str, List[str]]:
+    """Persist uploaded reference audios to a temp directory for inference."""
+    temp_dir = tempfile.mkdtemp(prefix="indextts_ref_")
+    saved_paths = []
+    try:
+        for idx, up_file in enumerate(upload_files):
+            if up_file is None:
+                continue
+            suffix = os.path.splitext(up_file.filename or "")[-1] or ".wav"
+            save_path = os.path.join(temp_dir, f"ref_{idx}{suffix}")
+            file_bytes = await up_file.read()
+            if not file_bytes:
+                raise ValueError(f"Uploaded file is empty: {up_file.filename or f'ref_{idx}'}")
+            with open(save_path, "wb") as f:
+                f.write(file_bytes)
+            saved_paths.append(save_path)
+        if not saved_paths:
+            raise ValueError("No valid uploaded audio files provided.")
+        return temp_dir, saved_paths
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
 @app.get("/health")
 async def health_check():
     """健康检查接口"""
@@ -87,11 +114,47 @@ async def health_check():
     500: {"content": {"application/json": {}}}
 })
 async def tts_api_url(request: Request):
+    temp_dir = None
     try:
-        data = await request.json()
-        text = data["text"]
-        audio_paths = data["audio_paths"]
-        seed = data.get("seed", 8)
+        content_type = request.headers.get("content-type", "").lower()
+        text = None
+        audio_paths = None
+        seed = 8
+
+        # Legacy JSON mode: {"text": "...", "audio_paths": ["..."], "seed": 8}
+        if "application/json" in content_type:
+            data = await request.json()
+            text = data["text"]
+            seed = int(data.get("seed", 8))
+            audio_paths = data.get("audio_paths")
+            # Backward compatibility for clients that send a single path field.
+            if audio_paths is None and data.get("spk_audio_path"):
+                audio_paths = [data["spk_audio_path"]]
+
+        # Remote upload mode:
+        # multipart/form-data with:
+        # - text: synthesis text
+        # - seed: optional
+        # - audio_files: one or multiple reference audio files
+        elif "multipart/form-data" in content_type:
+            form = await request.form()
+            text = form.get("text")
+            seed = int(form.get("seed", 8))
+
+            upload_files = []
+            for key in ("audio_files", "audio_paths", "audio_file", "file", "files"):
+                upload_files.extend([f for f in form.getlist(key) if isinstance(f, UploadFile)])
+            if not upload_files:
+                raise ValueError("No uploaded files found. Please use field 'audio_files'.")
+
+            temp_dir, audio_paths = await _save_uploaded_audio_files(upload_files)
+        else:
+            raise ValueError("Unsupported content type. Use application/json or multipart/form-data.")
+
+        if not text:
+            raise ValueError("Missing required field: text")
+        if not audio_paths or not isinstance(audio_paths, list):
+            raise ValueError("Missing required field: audio_paths (list) or uploaded audio_files")
 
         global tts
         sr, wav = await tts.infer(audio_paths, text, seed=seed)
@@ -111,6 +174,9 @@ async def tts_api_url(request: Request):
                 "error": str(tb_str)
             }
         )
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.post("/tts", responses={
